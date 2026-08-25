@@ -15,7 +15,7 @@ jobs:
     uses: ./.github/workflows/shared-workflow-terragrunt.yml 
 
     with:
-      provider: aws
+      # provider: aws
       working_directory: live/dev  
       env_name: dev
       terraform_version: "1.14.9"
