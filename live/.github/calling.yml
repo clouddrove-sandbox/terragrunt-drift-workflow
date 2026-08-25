@@ -1,0 +1,27 @@
+name: Terragrunt Drift Detection
+
+on:
+  push:
+    branches:
+      - master
+ 
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  drift:
+    uses: ./.github/workflows/shared-workflow-terragrunt.yml 
+
+    with:
+      provider: aws
+      working_directory: live/dev  
+      env_name: dev
+      terraform_version: "1.14.9"
+      terragrunt_version: "1.1.0"
+
+    secrets:
+        AWS_ACCESS_KEY_ID:  ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}   
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}              

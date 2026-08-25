@@ -1,0 +1,607 @@
+name: Terragrunt Drift Detection (AWS) - Reusable
+
+on:
+  workflow_call:
+    inputs:
+      env_name:
+        description: "Environment name (e.g. dev, qa, prod)"
+        required: false
+        type: string
+
+      working_directory:
+        description: "Path to the Terragrunt root directory"
+        required: true
+        type: string
+
+      terraform_version:
+        description: "Terraform version"
+        required: false
+        type: string
+        default: "1.14.9"
+
+      terragrunt_version:
+        description: "Terragrunt version"
+        required: false
+        type: string
+        default: "1.1.0"
+
+      queue_exclude_dirs:
+        description: "Comma-separated list of Terragrunt directories to exclude"
+        required: false
+        type: string
+        default: ""
+
+      aws_region:
+        description: "AWS region"
+        required: false
+        type: string
+        default: "eu-west-1"
+
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        description: "AWS access key"
+        required: true
+
+      AWS_SECRET_ACCESS_KEY:
+        description: "AWS secret access key"
+        required: true
+
+      AWS_SESSION_TOKEN:
+        description: "AWS session token"
+        required: false
+
+      BUILD_ROLE:
+        description: "IAM role to assume for Terraform/Terragrunt"
+        required: true
+
+      ENV_VARS:
+        description: "Multiline environment variables to pass to Terraform"
+        required: false
+
+      SLACK_WEBHOOK_URL:
+        description: "Slack Incoming Webhook URL"
+        required: false
+
+    outputs:
+      status:
+        description: "clean | drift | error"
+        value: ${{ jobs.drift.outputs.status }}
+
+      drift_count:
+        description: "Number of Terragrunt units containing drift"
+        value: ${{ jobs.drift.outputs.drift_count }}
+
+      error_count:
+        description: "Number of Terragrunt units containing errors"
+        value: ${{ jobs.drift.outputs.error_count }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tg-drift-aws-${{ inputs.env_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    name: ${{ inputs.env_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    outputs:
+      status: ${{ steps.plan.outputs.status }}
+      drift_count: ${{ steps.plan.outputs.drift_count }}
+      error_count: ${{ steps.plan.outputs.error_count }}
+
+    env:
+      TG_PROVIDER_CACHE: "1"
+      TG_TF_PATH: terraform
+      TG_NON_INTERACTIVE: "true"
+      TG_NO_COLOR: "true"
+
+    steps:
+
+      ##########################################################################
+      # Checkout
+      ##########################################################################
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      ##########################################################################
+      # Terraform
+      ##########################################################################
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      ##########################################################################
+      # Terragrunt
+      ##########################################################################
+
+      - name: Install Terragrunt
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ inputs.terragrunt_version }}"
+
+          curl -L \
+            "https://github.com/gruntwork-io/terragrunt/releases/download/v${VERSION}/terragrunt_linux_amd64" \
+            -o terragrunt
+
+          chmod +x terragrunt
+          sudo mv terragrunt /usr/local/bin/terragrunt
+
+          terragrunt --version
+
+      ##########################################################################
+      # Environment Variables
+      ##########################################################################
+
+      - name: Set environment variables
+        env:
+          ENV_VARS: ${{ secrets.ENV_VARS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "${ENV_VARS:-}" ]; then
+            echo "${ENV_VARS}" >> "$GITHUB_ENV"
+          fi
+
+      ##########################################################################
+      # AWS Authentication
+      ##########################################################################
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.BUILD_ROLE }}
+          aws-region: ${{ inputs.aws_region }}
+          role-duration-seconds: 3600
+          role-skip-session-tagging: true
+
+      ##########################################################################
+      # Verify AWS identity
+      ##########################################################################
+
+      - name: Verify AWS Authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "AWS Region: ${{ inputs.aws_region }}"
+
+          aws sts get-caller-identity
+
+      ##########################################################################
+      # Terragrunt Drift Detection
+      ##########################################################################
+
+      - name: Run Terragrunt Plan
+        id: plan
+        working-directory: ${{ inputs.working_directory }}
+        shell: bash
+        env:
+          QUEUE_EXCLUDE_DIRS: ${{ inputs.queue_exclude_dirs }}
+        run: |
+          set +e
+
+          ######################################################################
+          # Build optional exclude arguments
+          ######################################################################
+
+          EXCLUDE_ARGS=()
+
+          if [ -n "${QUEUE_EXCLUDE_DIRS:-}" ]; then
+
+            IFS=',' read -ra EXCLUDE_DIRS <<< "$QUEUE_EXCLUDE_DIRS"
+
+            for dir in "${EXCLUDE_DIRS[@]}"; do
+
+              dir="$(echo "$dir" | xargs)"
+
+              if [ -n "$dir" ]; then
+                EXCLUDE_ARGS+=("--queue-exclude-dir" "$dir")
+              fi
+
+            done
+
+          fi
+
+          ######################################################################
+          # Run Terragrunt plan
+          ######################################################################
+
+          terragrunt run --all \
+            "${EXCLUDE_ARGS[@]}" \
+            plan -- \
+            -lock=false \
+            -input=false \
+            -no-color \
+            -detailed-exitcode \
+            2>&1 | tee "${GITHUB_WORKSPACE}/plan.log"
+
+          rc=${PIPESTATUS[0]}
+
+          set -e
+
+          echo "Terragrunt exit code: $rc"
+
+          ######################################################################
+          # Remove ANSI codes / Terragrunt output prefixes
+          ######################################################################
+
+          sed -E \
+            's/\x1b\[[0-9;]*m//g; s/^[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+ (STDOUT|STDERR) //' \
+            "${GITHUB_WORKSPACE}/plan.log" \
+            > "${GITHUB_WORKSPACE}/plan.clean.log"
+
+          ######################################################################
+          # Prepare result files
+          ######################################################################
+
+          : > "${GITHUB_WORKSPACE}/drifted.tsv"
+          : > "${GITHUB_WORKSPACE}/errored.tsv"
+
+          ######################################################################
+          # Parse drift
+          ######################################################################
+
+          grep -E '\] terraform: Plan: [0-9]+ to add, [0-9]+ to change, [0-9]+ to destroy' \
+            "${GITHUB_WORKSPACE}/plan.clean.log" \
+            | grep -vE 'Plan: 0 to add, 0 to change, 0 to destroy' \
+            | sed -E \
+              's/^\[([^]]+)\] terraform: Plan: ([0-9]+) to add, ([0-9]+) to change, ([0-9]+) to destroy.*/\1\t+\2 ~\3 -\4/' \
+            | sort -u \
+            > "${GITHUB_WORKSPACE}/drifted.tsv" || true
+
+          ######################################################################
+          # Parse errors
+          ######################################################################
+
+          grep -E '\] terraform: Error:' \
+            "${GITHUB_WORKSPACE}/plan.clean.log" \
+            | sed -E \
+              's/^\[([^]]+)\] terraform: Error: (.*)/\1\t\2/' \
+            | sort -u \
+            > "${GITHUB_WORKSPACE}/errored.tsv" || true
+
+          ######################################################################
+          # Count results
+          ######################################################################
+
+          drift_count=$(awk 'END{print NR+0}' \
+            "${GITHUB_WORKSPACE}/drifted.tsv")
+
+          error_count=$(awk 'END{print NR+0}' \
+            "${GITHUB_WORKSPACE}/errored.tsv")
+
+          ######################################################################
+          # Determine overall status
+          ######################################################################
+
+          if [[ "$error_count" -gt 0 || "$rc" == "1" ]]; then
+
+            status="error"
+
+          elif [[ "$drift_count" -gt 0 || "$rc" == "2" ]]; then
+
+            status="drift"
+
+          else
+
+            status="clean"
+
+          fi
+
+          ######################################################################
+          # Parser safety check
+          ######################################################################
+
+          if [[ "$status" == "clean" ]] && \
+             [[ -s "${GITHUB_WORKSPACE}/plan.clean.log" ]] && \
+             ! grep -qE '\] terraform: (Plan: [0-9]|No changes|Error:)' \
+               "${GITHUB_WORKSPACE}/plan.clean.log"; then
+
+            echo "::warning::No recognizable Terraform output found."
+            echo "::warning::Terragrunt output format may have changed."
+
+            status="error"
+
+          fi
+
+          ######################################################################
+          # GitHub outputs
+          ######################################################################
+
+          {
+            echo "status=$status"
+            echo "drift_count=$drift_count"
+            echo "error_count=$error_count"
+          } >> "$GITHUB_OUTPUT"
+
+          ######################################################################
+          # Console summary
+          ######################################################################
+
+          echo ""
+          echo "================================"
+          echo "AWS Terragrunt Drift Detection"
+          echo "================================"
+          echo "Environment  : ${{ inputs.env_name }}"
+          echo "Region       : ${{ inputs.aws_region }}"
+          echo "Status       : $status"
+          echo "Drift Count  : $drift_count"
+          echo "Error Count  : $error_count"
+          echo "================================"
+
+          ######################################################################
+          # GitHub Step Summary
+          ######################################################################
+
+          {
+            echo "## AWS Terragrunt Drift Detection — ${{ inputs.env_name }}"
+            echo ""
+            echo "**AWS Region:** \`${{ inputs.aws_region }}\`"
+            echo ""
+            echo "**Status:** \`${status}\` · **Drifted:** ${drift_count} · **Errored:** ${error_count}"
+            echo ""
+
+            if [ "${drift_count}" -gt 0 ]; then
+
+              echo "### :pencil2: Drifted units"
+              echo ""
+
+              while IFS="$(printf '\t')" read -r unit counts; do
+
+                [ -z "${unit}" ] && continue
+
+                echo "<details><summary><code>${unit}</code> ${counts}</summary>"
+                echo ""
+                echo '```hcl'
+
+                grep -F "[${unit}] terraform:" \
+                  "${GITHUB_WORKSPACE}/plan.clean.log" \
+                  | sed -E 's/^\[[^]]+\] terraform: ?//'
+
+                echo '```'
+                echo ""
+                echo "</details>"
+
+              done < "${GITHUB_WORKSPACE}/drifted.tsv"
+
+            fi
+
+            if [ "${error_count}" -gt 0 ]; then
+
+              echo ""
+              echo "### :rotating_light: Errored units"
+              echo ""
+
+              while IFS="$(printf '\t')" read -r unit msg; do
+
+                [ -z "${unit}" ] && continue
+
+                echo "<details><summary><code>${unit}</code> — ${msg}</summary>"
+                echo ""
+                echo '```'
+
+                grep -F "[${unit}] terraform:" \
+                  "${GITHUB_WORKSPACE}/plan.clean.log" \
+                  | sed -E 's/^\[[^]]+\] terraform: ?//'
+
+                echo '```'
+                echo ""
+                echo "</details>"
+
+              done < "${GITHUB_WORKSPACE}/errored.tsv"
+
+            fi
+
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      ##########################################################################
+      # Slack Notification
+      ##########################################################################
+
+      - name: Notify Slack
+        if: ${{ steps.plan.outputs.status != 'clean' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ENV_NAME: ${{ inputs.env_name }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          STATUS: ${{ steps.plan.outputs.status }}
+          DRIFT_COUNT: ${{ steps.plan.outputs.drift_count }}
+          ERROR_COUNT: ${{ steps.plan.outputs.error_count }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SLACK_ICON_URL: https://clouddrove.com/assets/images/logo.png
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "Slack webhook is not configured. Skipping notification."
+            exit 0
+          fi
+
+          if [ "${STATUS}" = "error" ]; then
+
+            EMOJI=":rotating_light:"
+            HEADER="AWS infrastructure drift check failed"
+
+          else
+
+            EMOJI=":warning:"
+            HEADER="AWS infrastructure drift detected"
+
+          fi
+
+          payload=$(jq -n \
+            --arg emoji "$EMOJI" \
+            --arg header "$HEADER" \
+            --arg icon "$SLACK_ICON_URL" \
+            --arg env "$ENV_NAME" \
+            --arg region "$AWS_REGION" \
+            --arg status "$STATUS" \
+            --arg drift "$DRIFT_COUNT" \
+            --arg error "$ERROR_COUNT" \
+            --arg run "$RUN_URL" \
+            --arg repo "$REPO" \
+            --arg ref "$REF_NAME" \
+            --rawfile drifted "${GITHUB_WORKSPACE}/drifted.tsv" \
+            --rawfile errored "${GITHUB_WORKSPACE}/errored.tsv" \
+            '
+            def cap($x):
+              if ($x | length) > 2800
+              then ($x[0:2750] + "\n... (truncated - see run)")
+              else $x
+              end;
+
+            def fmt($s; $sep):
+              ($s | rtrimstr("\n")) as $t
+              | if ($t | length) == 0 then []
+                else
+                  (
+                    $t
+                    | split("\n")
+                    | map(
+                        split("\t")
+                        | "-  `\(.[0])`\($sep)\(.[1] |
+                          if length > 140
+                          then .[0:140] + "..."
+                          else .
+                          end)"
+                      )
+                  )
+                end;
+
+            {
+              blocks: (
+                [
+                  {
+                    type: "header",
+                    text: {
+                      type: "plain_text",
+                      emoji: true,
+                      text: "\($emoji) \($header) - \($env)"
+                    }
+                  },
+                  {
+                    type: "section",
+                    fields: [
+                      {
+                        type: "mrkdwn",
+                        text: "*Environment*\n`\($env)`"
+                      },
+                      {
+                        type: "mrkdwn",
+                        text: "*AWS Region*\n`\($region)`"
+                      },
+                      {
+                        type: "mrkdwn",
+                        text: "*Status*\n`\($status)`"
+                      },
+                      {
+                        type: "mrkdwn",
+                        text: "*Drifted*\n\($drift) unit(s)"
+                      },
+                      {
+                        type: "mrkdwn",
+                        text: "*Errored*\n\($error) unit(s)"
+                      }
+                    ]
+                  }
+                ]
+
+                + (
+                    fmt($drifted; "   ") as $d
+                    | if ($d | length) == 0 then []
+                      else [
+                        {
+                          type: "divider"
+                        },
+                        {
+                          type: "section",
+                          text: {
+                            type: "mrkdwn",
+                            text: cap(
+                              ":pencil2: *Drifted units*   _(+add  ~change  -destroy)_\n"
+                              + ($d | join("\n"))
+                            )
+                          }
+                        }
+                      ]
+                      end
+                  )
+
+                + (
+                    fmt($errored; "  -  ") as $e
+                    | if ($e | length) == 0 then []
+                      else [
+                        {
+                          type: "divider"
+                        },
+                        {
+                          type: "section",
+                          text: {
+                            type: "mrkdwn",
+                            text: cap(
+                              ":rotating_light: *Errored units*\n"
+                              + ($e | join("\n"))
+                            )
+                          }
+                        }
+                      ]
+                      end
+                  )
+
+                + [
+                    {
+                      type: "context",
+                      elements: [
+                        {
+                          type: "mrkdwn",
+                          text: "AWS Infrastructure Drift Detection - `\($repo)@\($ref)` - read-only plan"
+                        }
+                      ]
+                    },
+                    {
+                      type: "actions",
+                      elements: [
+                        {
+                          type: "button",
+                          text: {
+                            type: "plain_text",
+                            text: "View run"
+                          },
+                          url: $run,
+                          style: "primary"
+                        }
+                      ]
+                    }
+                  ]
+              )
+            }')
+
+          code=$(curl -sS \
+            -o /tmp/slack_resp \
+            -w '%{http_code}' \
+            -X POST \
+            -H 'Content-type: application/json' \
+            --data "$payload" \
+            "$SLACK_WEBHOOK_URL")
+
+          echo "Slack HTTP ${code}: $(cat /tmp/slack_resp)"
+
+          [ "${code}" = "200" ]

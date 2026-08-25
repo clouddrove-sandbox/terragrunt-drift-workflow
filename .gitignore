@@ -1,0 +1,23 @@
+
+# Terragrunt
+.terragrunt-cache/
+**/.terragrunt-cache/**
+
+# Terraform generated directories
+.terraform/
+**/.terraform/**
+
+# Terraform state
+*.tfstate
+*.tfstate.*
+
+# Terraform plans
+*.tfplan
+tfplan
+
+# Terraform crash logs
+crash.log
+crash.*.log
+
+# macOS
+.DS_Store
