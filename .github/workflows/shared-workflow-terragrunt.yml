@@ -94,7 +94,7 @@ jobs:
       error_count: ${{ steps.plan.outputs.error_count }}
 
     env:
-      TG_PROVIDER_CACHE: "1"
+      TG_PROVIDER_CACHE: "0"
       TG_TF_PATH: terraform
       TG_NON_INTERACTIVE: "true"
       TG_NO_COLOR: "true"
