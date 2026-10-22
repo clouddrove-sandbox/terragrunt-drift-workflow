@@ -1,29 +1,117 @@
+
 name: Terragrunt Drift Detection
 
 on:
   push:
     branches:
       - master
- 
+
+  workflow_dispatch:
 
 permissions:
   contents: read
   id-token: write
 
 jobs:
+
+  # ------------------------------------------
+  # AWS Sandbox IAM Role and S3 Access Test
+  # ------------------------------------------
+  test-aws-role:
+    name: Test AWS Sandbox Role
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS Credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::425046147001:role/cd-sandbox-github-deploy
+          aws-region: ca-central-1
+          role-session-name: github-sandbox-test
+          allowed-account-ids: 425046147001
+
+      - name: Verify AWS Account and IAM Role
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking AWS Account..."
+          aws sts get-caller-identity
+
+          ACCOUNT_ID=$(aws sts get-caller-identity \
+            --query Account --output text)
+
+          ROLE_ARN=$(aws sts get-caller-identity \
+            --query Arn --output text)
+
+          if [[ "$ACCOUNT_ID" != "425046147001" ]]; then
+            echo "ERROR: Incorrect AWS account!"
+            exit 1
+          fi
+
+          if [[ "$ROLE_ARN" != arn:aws:sts::425046147001:assumed-role/cd-sandbox-github-deploy/* ]]; then
+            echo "ERROR: Incorrect IAM role!"
+            exit 1
+          fi
+
+          echo "SUCCESS: Correct AWS account and IAM role!"
+
+      - name: Verify S3 Bucket Access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking S3 bucket access..."
+
+          aws s3api head-bucket \
+            --bucket cd-sandbox-test-tfstate-304b \
+            --region ca-central-1
+
+          echo "SUCCESS: S3 bucket is accessible!"
+
+      - name: Verify S3 List Permission
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking S3 list permission..."
+
+          aws s3api list-objects-v2 \
+            --bucket cd-sandbox-test-tfstate-304b \
+            --region ca-central-1 \
+            --max-items 5 \
+            --query 'Contents[].Key' \
+            --output json
+
+          echo "SUCCESS: S3 list permission verified!"
+
+      - name: Test Summary
+        run: |
+          echo "==================================="
+          echo "AWS SANDBOX TEST PASSED"
+          echo "Account: 425046147001"
+          echo "Region: ca-central-1"
+          echo "Role: cd-sandbox-github-deploy"
+          echo "Bucket: cd-sandbox-test-tfstate-304b"
+          echo "==================================="
+
+  # ------------------------------------------
+  # Existing Terragrunt Drift Detection
+  # ------------------------------------------
   drift:
-    uses: ./.github/workflows/shared-workflow-terragrunt.yml 
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/shared-workflow-terragrunt.yml
 
     with:
       # provider: aws
-      working_directory: live/dev  
+      working_directory: live/dev
       env_name: dev
       terraform_version: "1.14.9"
       terragrunt_version: "1.1.0"
 
     secrets:
-        AWS_ACCESS_KEY_ID:  ${{ secrets.AWS_ACCESS_KEY_ID }}
-        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-        # BUILD_ROLE: ${{ secrets.BUILD_ROLE }}
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}              
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      # BUILD_ROLE: ${{ secrets.BUILD_ROLE }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
